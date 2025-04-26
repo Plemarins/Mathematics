@@ -1,0 +1,144 @@
+% Alysteriumプログラム：FMMで非線形積分方程式を解く
+program fmm_parallel
+
+% 並列環境の初期化
+parallel_init(rank, size)
+
+% パラメータ定義
+n := 1000          % 点数
+m := size          % クラスタ数（プロセス数）
+block_size := n / m
+epsilon := 0.1     % 非線形項の強さ
+L := 10            % 多重極展開の次数
+omega := [0, 1]^2  % 2次元積分区間
+t_max := 1.0       % 最大時間
+dt := 0.01         % 時間刻み
+steps := t_max / dt
+
+% 配列の割り当て
+P := matrix(block_size, n)  % 確率密度
+P0 := matrix(block_size, n) % 初期条件
+K := matrix(n, n)          % カーネル
+M := tensor(block_size, L)  % モーメント
+T := tensor(block_size, L)  % 変換項
+temp := matrix(block_size, n)
+
+% 初期化（一様分布）
+flow i from 1 to block_size
+  flow j from 1 to n
+    P[i,j] := 1.0 / n
+    P0[i,j] := 1.0 / n
+  end
+end
+
+% カーネル設定（ガウスカーネル）
+flow rank = 0
+  flow i from 1 to n
+    flow j from 1 to n
+      K[i,j] := exp(-|x_i - x_j|^2)
+    end
+  end
+end
+broadcast(K, root=0)
+
+% 時間発展
+fold t from 1 to steps
+  % クラスタ分割（八分木）
+  clusters := octree(omega, n, block_size)
+
+  % モーメント計算（遠方場）
+  parallel_fold c in clusters
+    M[c] := compute_moments(P, K, L, c)
+  end
+  broadcast(M, root=0)
+
+  % 変換項計算
+  parallel_fold c in clusters
+    T[c] := compute_transfers(M, x, L, c)
+  end
+
+  % 近傍場計算
+  parallel_fold i from 1 to block_size
+    temp[i,:] := compute_near_field(P, K, clusters, i)
+  end
+
+  % 積分結果
+  P_new := P0 + epsilon * (T + temp)
+
+  % 正規化
+  parallel_fold i from 1 to block_size
+    P_new[i,:] := normalize(P_new[i,:])
+  end
+
+  P := P_new
+end
+
+% 結果出力
+flow rank = 0
+  print("Final P[1,1] = ", P[1,1])
+end
+
+% メモリ解放
+free(P, P0, K, M, T, temp)
+
+% 並列環境の終了
+parallel_finalize()
+
+% モーメント計算
+function compute_moments(P, K, L, cluster) return tensor
+  M := tensor(L)
+  flow l from 0 to L
+    flow m from -l to l
+      M[l,m] := sum(P[y] * K[x_c, y], y in cluster)
+    end
+  end
+  return M
+end
+
+% 変換項計算
+function compute_transfers(M, x, L, cluster) return tensor
+  T := tensor(L)
+  flow l from 0 to L
+    flow m from -l to l
+      T[l,m] := M[l,m] * harmonic(x - x_c, l, m)
+    end
+  end
+  return T
+end
+
+% 近傍場計算
+function compute_near_field(P, K, clusters, i) return vector
+  near := 0
+  flow y in near_clusters(i)
+    near := near + K[x_i, y] * (P[y]^2 - P[y])
+  end
+  return near
+end
+
+% 正規化
+function normalize(row) return vector
+  sum := reduce_add(row)
+  return row / sum
+end
+
+% 可逆実行（逆時間発展）
+inverse fmm_parallel
+  fold t from steps to 1
+    clusters := octree(omega, n, block_size)
+    parallel_fold c in clusters
+      M[c] := compute_moments(P, K, L, c)
+    end
+    broadcast(M, root=0)
+    parallel_fold c in clusters
+      T[c] := compute_transfers(M, x, L, c)
+    end
+    parallel_fold i from 1 to block_size
+      temp[i,:] := compute_near_field(P, K, clusters, i)
+    end
+    P_new := P - epsilon * (T + temp)  % 逆方向
+    parallel_fold i from 1 to block_size
+      P_new[i,:] := normalize(P_new[i,:])
+    end
+    P := P_new
+  end
+end
