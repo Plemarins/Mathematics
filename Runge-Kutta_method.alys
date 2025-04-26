@@ -1,0 +1,119 @@
+% Alysteriumプログラム：RK4で非線形確率行列方程式を解く
+program rk4_parallel
+
+% 並列環境の初期化（MPI風）
+parallel_init(rank, size)
+
+% パラメータ定義
+n := 100           % 行列サイズ
+m := size          % ブロック数（プロセス数）
+block_size := n / m
+epsilon := 0.1     % 非線形項の強さ
+dt := 0.01         % 時間刻み
+t_max := 1.0       % 最大時間
+steps := t_max / dt
+
+% 配列の割り当て（行列型）
+P := matrix(block_size, n)
+P_new := matrix(block_size, n)
+A := matrix(n, n)
+k1 := matrix(block_size, n)
+k2 := matrix(block_size, n)
+k3 := matrix(block_size, n)
+k4 := matrix(block_size, n)
+temp := matrix(block_size, n)
+
+% 初期確率行列（一様分布）
+flow i from 1 to block_size
+  flow j from 1 to n
+    P[i,j] := 1.0 / n
+  end
+end
+
+% 生成行列Aの設定（ランダムウォーク）
+flow rank = 0
+  flow i from 1 to n
+    A[i,i] := -2.0
+    if i > 1
+      A[i,i-1] := 1.0
+    end
+    if i < n
+      A[i,i+1] := 1.0
+    end
+  end
+end
+broadcast(A, root=0)
+
+% 時間発展
+fold t from 1 to steps
+  t_val := (t-1) * dt
+
+  % k1 = f(t, P)
+  k1 := compute_f(P, A, epsilon)
+
+  % k2 = f(t + dt/2, P + dt/2 * k1)
+  temp := P + 0.5 * dt * k1
+  k2 := compute_f(temp, A, epsilon)
+
+  % k3 = f(t + dt/2, P + dt/2 * k2)
+  temp := P + 0.5 * dt * k2
+  k3 := compute_f(temp, A, epsilon)
+
+  % k4 = f(t + dt, P + dt * k3)
+  temp := P + dt * k3
+  k4 := compute_f(temp, A, epsilon)
+
+  % 更新
+  P_new := P + (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+  % 正規化（並列実行）
+  parallel_fold i from 1 to block_size
+    P_new[i,:] := normalize(P_new[i,:])
+  end
+
+  P := P_new
+end
+
+% 結果出力（rank 0）
+flow rank = 0
+  print("Final P[1,1] = ", P[1,1])
+end
+
+% メモリ解放
+free(P, P_new, A, k1, k2, k3, k4, temp)
+
+% 並列環境の終了
+parallel_finalize()
+
+% 関数：f(t, P) = A*P + epsilon*(P^2 - P)
+function compute_f(P_in, A, epsilon) return matrix
+  f_out := matmul(P_in, A)  % 線形項
+  P_sq := matmul(P_in, P_in)  % 非線形項
+  f_out := f_out + epsilon * (P_sq - P_in)
+  return f_out
+end
+
+% 正規化関数
+function normalize(row) return vector
+  sum := reduce_add(row)
+  return row / sum
+end
+
+% 可逆実行（例：逆時間発展）
+inverse rk4_parallel
+  fold t from steps to 1
+    t_val := (t-1) * dt
+    k1 := compute_f(P, A, epsilon)
+    temp := P - 0.5 * dt * k1
+    k2 := compute_f(temp, A, epsilon)
+    temp := P - 0.5 * dt * k2
+    k3 := compute_f(temp, A, epsilon)
+    temp := P - dt * k3
+    k4 := compute_f(temp, A, epsilon)
+    P_new := P - (dt / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+    parallel_fold i from 1 to block_size
+      P_new[i,:] := normalize(P_new[i,:])
+    end
+    P := P_new
+  end
+end
